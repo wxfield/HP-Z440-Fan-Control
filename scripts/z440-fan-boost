@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HWMIO=${HWMIO:-/usr/local/sbin/z440-hwmio}
+duration=${1:-300}
+[[ $duration =~ ^[0-9]+$ ]] || { echo "usage: $0 [seconds]" >&2; exit 2; }
+(( duration >= 10 && duration <= 86400 )) || {
+    echo "duration must be between 10 and 86400 seconds" >&2
+    exit 2
+}
+
+runtime_dir=/run/z440-fan-control
+install -d -m 0755 "$runtime_dir"
+boost_until=$(($(date +%s) + duration))
+printf '%s\n' "$boost_until" > "$runtime_dir/boost-until"
+"$HWMIO" write-fan 0x0198 0x7e >/dev/null
+"$HWMIO" write-fan 0x019a 0xb7 >/dev/null
+"$HWMIO" write-fan 0x019b 0xb7 >/dev/null
+"$HWMIO" write-fan 0x019c 0x7e >/dev/null
+"$HWMIO" write-fan 0x019d 0x7e >/dev/null
+printf 'Managed fan boost enabled for %s seconds (until %s)\n' \
+    "$duration" "$(date --date="@$boost_until" --iso-8601=seconds)"

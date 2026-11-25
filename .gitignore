@@ -1,0 +1,10 @@
+/build/
+*.o
+*.log
+*.bin
+*.BIN
+*.rom
+*.fd
+*.efi
+*.zip
+.DS_Store

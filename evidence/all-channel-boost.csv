@@ -1,0 +1,5 @@
+phase,cpu_pwm,memory_pwm,rear_pwm_a,rear_pwm_b,front_pwm,cpu_rpm,rear_rpm,front_rpm,memory0_rpm,memory1_rpm,package_c
+idle,0x25,0x2c,0x2c,0x23,0x25,1138,1395,1103,1329,1288,29
+boost_rising,0x7e,0xb7,0xb7,0x7e,0x7e,2567,2723,3174,2820,2759,29
+boost_near_settled,0x7e,0xb7,0xb7,0x7e,0x7e,3627,3529,3640,4316,4270,30
+boost_settled,0x7e,0xb7,0xb7,0x7e,0x7e,3607,3482,3629,5514,5509,30

@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HWMIO=${HWMIO:-/usr/local/sbin/z440-hwmio}
+CPU_FAN_REGISTER=0x0198
+CPU_TACH_REGISTER=0x0072
+MEMORY_FAN_REGISTER=0x019a
+MEMORY_TACH_REGISTERS=(0x0064 0x0066)
+REAR_FAN_DEMAND_A_REGISTER=0x019b
+REAR_FAN_DEMAND_B_REGISTER=0x019c
+REAR_TACH_REGISTER=0x006a
+FRONT_FAN_REGISTER=0x019d
+FRONT_TACH_REGISTER=0x006e
+BOOST_FILE=${BOOST_FILE:-/run/z440-fan-control/boost-until}
+POLL_SECONDS=${POLL_SECONDS:-2}
+LOWER_DWELL_CYCLES=${LOWER_DWELL_CYCLES:-5}
+LOG_EVERY_CYCLES=${LOG_EVERY_CYCLES:-15}
+MIN_SAFE_RPM=${MIN_SAFE_RPM:-500}
+
+# Six HP-derived Z440 levels. See docs/REGISTER_MAP.md.
+CPU_PWM_VALUES=(0x25 0x37 0x49 0x5b 0x6c 0x7e)
+MEMORY_PWM_VALUES=(0x2c 0x48 0x64 0x7f 0x9b 0xb7)
+REAR_A_PWM_VALUES=(0x2c 0x48 0x64 0x7f 0x9b 0xb7)
+REAR_B_PWM_VALUES=(0x23 0x35 0x47 0x5a 0x6c 0x7e)
+FRONT_PWM_VALUES=(0x25 0x37 0x49 0x5b 0x6c 0x7e)
+
+set_fan_level() {
+    local index=$1
+    "$HWMIO" write-fan "$CPU_FAN_REGISTER" "${CPU_PWM_VALUES[index]}" >/dev/null
+    "$HWMIO" write-fan "$MEMORY_FAN_REGISTER" "${MEMORY_PWM_VALUES[index]}" >/dev/null
+    "$HWMIO" write-fan "$REAR_FAN_DEMAND_A_REGISTER" "${REAR_A_PWM_VALUES[index]}" >/dev/null
+    "$HWMIO" write-fan "$REAR_FAN_DEMAND_B_REGISTER" "${REAR_B_PWM_VALUES[index]}" >/dev/null
+    "$HWMIO" write-fan "$FRONT_FAN_REGISTER" "${FRONT_PWM_VALUES[index]}" >/dev/null
+}
+
+force_maximum() {
+    set_fan_level 5 >/dev/null 2>&1 || true
+}
+
+cleanup_done=0
+cleanup() {
+    if (( cleanup_done == 0 )); then
+        cleanup_done=1
+        force_maximum
+        logger -t z440-fan-control "controller stopped; managed fans forced to maximum"
+    fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 0' HUP INT TERM
+
+find_package_temp() {
+    local hwmon label
+    for hwmon in /sys/class/hwmon/hwmon*; do
+        [[ -r "$hwmon/name" ]] || continue
+        [[ $(<"$hwmon/name") == coretemp ]] || continue
+        for label in "$hwmon"/temp*_label; do
+            [[ -r "$label" ]] || continue
+            if [[ $(<"$label") == "Package id 0" ]]; then
+                printf '%s\n' "${label%_label}_input"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+read_cpu_counters() {
+    local tag user nice system idle iowait irq softirq steal guest guest_nice
+    read -r tag user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+    CPU_IDLE=$((idle + iowait))
+    CPU_TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal))
+}
+
+desired_from_temperature() {
+    local temp_millideg=$1
+    if (( temp_millideg >= 56000 )); then echo 5
+    elif (( temp_millideg >= 51000 )); then echo 4
+    elif (( temp_millideg >= 46000 )); then echo 3
+    elif (( temp_millideg >= 41000 )); then echo 2
+    elif (( temp_millideg >= 36000 )); then echo 1
+    else echo 0
+    fi
+}
+
+TEMP_INPUT=$(find_package_temp) || {
+    echo "Unable to find coretemp Package id 0 sensor" >&2
+    exit 1
+}
+[[ -x "$HWMIO" ]] || { echo "Missing $HWMIO" >&2; exit 1; }
+
+current_index=5
+lower_cycles=0
+log_cycles=0
+invalid_tach_cycles=0
+set_fan_level "$current_index"
+read_cpu_counters
+previous_idle=$CPU_IDLE
+previous_total=$CPU_TOTAL
+echo "controller started: temp_sensor=$TEMP_INPUT level=$current_index"
+
+while sleep "$POLL_SECONDS"; do
+    if [[ ! -r "$TEMP_INPUT" ]]; then
+        echo "temperature sensor disappeared; forcing maximum" >&2
+        force_maximum
+        exit 1
+    fi
+    temp_millideg=$(<"$TEMP_INPUT")
+    if [[ ! $temp_millideg =~ ^[0-9]+$ ]] || (( temp_millideg > 110000 )); then
+        echo "invalid package temperature '$temp_millideg'; forcing maximum" >&2
+        force_maximum
+        exit 1
+    fi
+
+    read_cpu_counters
+    delta_idle=$((CPU_IDLE - previous_idle))
+    delta_total=$((CPU_TOTAL - previous_total))
+    previous_idle=$CPU_IDLE
+    previous_total=$CPU_TOTAL
+    if (( delta_total <= 0 )); then
+        busy_percent=100
+    else
+        busy_percent=$(((delta_total - delta_idle) * 100 / delta_total))
+    fi
+
+    desired_index=$(desired_from_temperature "$temp_millideg")
+    # Feed-forward raises airflow before the thermal sensor catches up.
+    if (( busy_percent >= 35 )); then desired_index=5
+    elif (( busy_percent >= 20 && desired_index < 3 )); then desired_index=3
+    elif (( busy_percent >= 10 && desired_index < 2 )); then desired_index=2
+    fi
+
+    now=$(date +%s)
+    if [[ -r "$BOOST_FILE" ]]; then
+        boost_until=$(<"$BOOST_FILE")
+        if [[ $boost_until =~ ^[0-9]+$ ]] && (( boost_until > now )); then
+            desired_index=5
+        else
+            rm -f "$BOOST_FILE"
+        fi
+    fi
+
+    changed=0
+    if (( desired_index > current_index )); then
+        current_index=$desired_index
+        lower_cycles=0
+        changed=1
+    elif (( desired_index < current_index )); then
+        ((lower_cycles += 1))
+        if (( lower_cycles >= LOWER_DWELL_CYCLES )); then
+            current_index=$desired_index
+            lower_cycles=0
+            changed=1
+        fi
+    else
+        lower_cycles=0
+    fi
+
+    actual_cpu_pwm=$($HWMIO read "$CPU_FAN_REGISTER") || actual_cpu_pwm=invalid
+    actual_memory_pwm=$($HWMIO read "$MEMORY_FAN_REGISTER") || actual_memory_pwm=invalid
+    actual_rear_a_pwm=$($HWMIO read "$REAR_FAN_DEMAND_A_REGISTER") || actual_rear_a_pwm=invalid
+    actual_rear_b_pwm=$($HWMIO read "$REAR_FAN_DEMAND_B_REGISTER") || actual_rear_b_pwm=invalid
+    actual_front_pwm=$($HWMIO read "$FRONT_FAN_REGISTER") || actual_front_pwm=invalid
+    if (( changed == 1 )) || [[ $actual_cpu_pwm != "${CPU_PWM_VALUES[current_index]}" ]] || \
+       [[ $actual_memory_pwm != "${MEMORY_PWM_VALUES[current_index]}" ]] || \
+       [[ $actual_rear_a_pwm != "${REAR_A_PWM_VALUES[current_index]}" ]] || \
+       [[ $actual_rear_b_pwm != "${REAR_B_PWM_VALUES[current_index]}" ]] || \
+       [[ $actual_front_pwm != "${FRONT_PWM_VALUES[current_index]}" ]]; then
+        set_fan_level "$current_index"
+        changed=1
+    fi
+
+    # A host-control commit briefly clears the tach latch on this firmware.
+    if (( changed == 1 )); then
+        sleep 1
+    fi
+
+    cpu_rpm=$($HWMIO read-word "$CPU_TACH_REGISTER") || cpu_rpm=0
+    memory_rpm_0=$($HWMIO read-word "${MEMORY_TACH_REGISTERS[0]}") || memory_rpm_0=0
+    memory_rpm_1=$($HWMIO read-word "${MEMORY_TACH_REGISTERS[1]}") || memory_rpm_1=0
+    rear_rpm=$($HWMIO read-word "$REAR_TACH_REGISTER") || rear_rpm=0
+    front_rpm=$($HWMIO read-word "$FRONT_TACH_REGISTER") || front_rpm=0
+    if [[ ! $cpu_rpm =~ ^[0-9]+$ ]] || [[ ! $memory_rpm_0 =~ ^[0-9]+$ ]] || \
+       [[ ! $memory_rpm_1 =~ ^[0-9]+$ ]] || [[ ! $rear_rpm =~ ^[0-9]+$ ]] || \
+       [[ ! $front_rpm =~ ^[0-9]+$ ]] || \
+       (( cpu_rpm < MIN_SAFE_RPM || cpu_rpm == 65535 || \
+          memory_rpm_0 < MIN_SAFE_RPM || memory_rpm_0 == 65535 || \
+          memory_rpm_1 < MIN_SAFE_RPM || memory_rpm_1 == 65535 || \
+          rear_rpm < MIN_SAFE_RPM || rear_rpm == 65535 || \
+          front_rpm < MIN_SAFE_RPM || front_rpm == 65535 )); then
+        ((invalid_tach_cycles += 1))
+        echo "unsafe tach cpu=$cpu_rpm rear=$rear_rpm front=$front_rpm memory=$memory_rpm_0/$memory_rpm_1 (sample $invalid_tach_cycles/3); forcing maximum" >&2
+        force_maximum
+        current_index=5
+        lower_cycles=0
+        if (( invalid_tach_cycles >= 3 )); then
+            echo "three consecutive invalid tach samples; stopping for systemd recovery" >&2
+            exit 1
+        fi
+        continue
+    fi
+    invalid_tach_cycles=0
+
+    ((log_cycles += 1))
+    if (( changed == 1 || log_cycles >= LOG_EVERY_CYCLES )); then
+        printf 'temp_c=%d.%03d cpu_busy=%d%% level=%d cpu_pwm=%s cpu_rpm=%s rear_pwm=%s/%s rear_rpm=%s front_pwm=%s front_rpm=%s memory_pwm=%s memory_rpm=%s/%s\n' \
+            "$((temp_millideg / 1000))" "$((temp_millideg % 1000))" "$busy_percent" \
+            "$current_index" "${CPU_PWM_VALUES[current_index]}" "$cpu_rpm" \
+            "${REAR_A_PWM_VALUES[current_index]}" "${REAR_B_PWM_VALUES[current_index]}" "$rear_rpm" \
+            "${FRONT_PWM_VALUES[current_index]}" "$front_rpm" \
+            "${MEMORY_PWM_VALUES[current_index]}" "$memory_rpm_0" "$memory_rpm_1"
+        log_cycles=0
+    fi
+done

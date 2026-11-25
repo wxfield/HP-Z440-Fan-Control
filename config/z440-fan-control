@@ -1,0 +1,11 @@
+# Poll hardware every two seconds.
+POLL_SECONDS=2
+
+# Wait this many stable cycles before reducing speed.
+LOWER_DWELL_CYCLES=5
+
+# Emit a status line every N cycles even when the level does not change.
+LOG_EVERY_CYCLES=15
+
+# Any populated managed tach below this value is treated as unsafe.
+MIN_SAFE_RPM=500
